@@ -1,0 +1,240 @@
+name: Run CloudKid Containers (Advanced)
+
+on:
+  workflow_dispatch:
+    inputs:
+      container_count:
+        description: 'Number of containers to run (1-20)'
+        required: false
+        default: '10'
+        type: choice
+        options:
+          - '1'
+          - '5'
+          - '10'
+          - '15'
+          - '20'
+      keep_running_minutes:
+        description: 'Keep containers running for (minutes)'
+        required: false
+        default: '5'
+        type: string
+      cleanup_after:
+        description: 'Cleanup containers after completion'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/cloudkid
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to GitHub Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Check Docker setup
+      run: |
+        docker version
+        docker info
+    
+    - name: Build CloudKid image
+      run: |
+        # Check if Dockerfile exists
+        if [ -f "Dockerfile" ]; then
+          echo "Building CloudKid image from Dockerfile..."
+          docker build -t cloudkid:latest .
+          
+          # Tag for registry if not a PR
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            docker tag cloudkid:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            docker tag cloudkid:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          fi
+        else
+          echo "No Dockerfile found. Attempting to use pre-built image..."
+          # Add logic here to pull from a registry if needed
+        fi
+    
+    - name: Push image to registry
+      if: github.event_name != 'pull_request' && hashFiles('Dockerfile') != ''
+      run: |
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+    
+    - name: Run CloudKid containers
+      id: run_containers
+      run: |
+        CONTAINER_COUNT=${{ github.event.inputs.container_count || '10' }}
+        echo "container_count=$CONTAINER_COUNT" >> $GITHUB_OUTPUT
+        
+        # Create network for containers
+        docker network create cloudkid-net 2>/dev/null || true
+        
+        echo "Starting $CONTAINER_COUNT CloudKid containers..."
+        
+        # Start containers with proper error handling
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          NAME="wasque${i}"
+          
+          echo "[$i/$CONTAINER_COUNT] Starting container $NAME on port $PORT..."
+          
+          # Run container with health check
+          if docker run -d \
+            --name $NAME \
+            --rm \
+            --privileged \
+            --network cloudkid-net \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -p ${PORT}:1080 \
+            --health-cmd="nc -z localhost 1080 || exit 1" \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=3 \
+            cloudkid:latest; then
+            
+            echo "✓ Container $NAME started successfully"
+            
+            # Wait for health check
+            echo "  Waiting for container to be healthy..."
+            HEALTH_CHECK_ATTEMPTS=0
+            MAX_ATTEMPTS=30
+            
+            while [ $HEALTH_CHECK_ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+              HEALTH_STATUS=$(docker inspect --format='{{.State.Health.Status}}' $NAME 2>/dev/null || echo "unknown")
+              if [ "$HEALTH_STATUS" = "healthy" ]; then
+                echo "  ✓ Container $NAME is healthy"
+                break
+              elif [ "$HEALTH_STATUS" = "unhealthy" ]; then
+                echo "  ✗ Container $NAME is unhealthy"
+                docker logs $NAME
+                exit 1
+              fi
+              sleep 2
+              HEALTH_CHECK_ATTEMPTS=$((HEALTH_CHECK_ATTEMPTS + 1))
+            done
+            
+            if [ $HEALTH_CHECK_ATTEMPTS -eq $MAX_ATTEMPTS ]; then
+              echo "  ⚠ Health check timeout for $NAME"
+            fi
+          else
+            echo "✗ Failed to start container $NAME"
+            exit 1
+          fi
+          
+          # Wait before starting next container
+          if [ $i -lt $CONTAINER_COUNT ]; then
+            echo "Waiting 30 seconds before starting next container..."
+            sleep 30
+          fi
+        done
+        
+        echo "All containers started successfully!"
+    
+    - name: Display container status
+      run: |
+        echo "=== CloudKid Container Status ==="
+        docker ps --filter "name=wasque" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.State}}"
+        
+        echo -e "\n=== Container Resource Usage ==="
+        docker stats --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}" $(docker ps --filter "name=wasque" -q)
+    
+    - name: Test container connectivity
+      run: |
+        echo "=== Testing Container Connectivity ==="
+        CONTAINER_COUNT=${{ steps.run_containers.outputs.container_count }}
+        
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          NAME="wasque${i}"
+          
+          echo -n "Testing $NAME on port $PORT... "
+          
+          # Test if port is open
+          if timeout 5 bash -c "echo >/dev/tcp/localhost/$PORT" 2>/dev/null; then
+            echo "✓ Port $PORT is open"
+          else
+            echo "✗ Port $PORT is not accessible"
+          fi
+        done
+    
+    - name: Keep containers running
+      if: github.event.inputs.keep_running_minutes != '0'
+      run: |
+        DURATION=${{ github.event.inputs.keep_running_minutes || '5' }}
+        echo "Keeping containers running for $DURATION minutes..."
+        echo "You can monitor the containers in the GitHub Actions logs."
+        
+        # Display status every minute
+        for minute in $(seq 1 $DURATION); do
+          echo -e "\n=== Status at minute $minute/$DURATION ==="
+          docker ps --filter "name=wasque" --format "table {{.Names}}\t{{.Status}}"
+          
+          if [ $minute -lt $DURATION ]; then
+            sleep 60
+          fi
+        done
+    
+    - name: Collect container logs
+      if: always()
+      run: |
+        echo "=== Collecting Container Logs ==="
+        mkdir -p container-logs
+        
+        for container in $(docker ps -a --filter "name=wasque" --format "{{.Names}}"); do
+          echo "Collecting logs for $container..."
+          docker logs $container > "container-logs/${container}.log" 2>&1 || true
+        done
+        
+        # Create summary
+        echo "Log files created:"
+        ls -la container-logs/
+    
+    - name: Upload container logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: container-logs
+        path: container-logs/
+        retention-days: 7
+    
+    - name: Cleanup
+      if: always() && github.event.inputs.cleanup_after != 'false'
+      run: |
+        echo "=== Cleaning up containers ==="
+        
+        # Stop all wasque containers
+        docker ps --filter "name=wasque" -q | xargs -r docker stop || true
+        
+        # Remove network
+        docker network rm cloudkid-net 2>/dev/null || true
+        
+        echo "Cleanup completed"
+    
+    - name: Summary
+      if: always()
+      run: |
+        echo "=== Workflow Summary ==="
+        echo "Containers requested: ${{ github.event.inputs.container_count || '10' }}"
+        echo "Runtime duration: ${{ github.event.inputs.keep_running_minutes || '5' }} minutes"
+        echo "Cleanup performed: ${{ github.event.inputs.cleanup_after != 'false' && 'Yes' || 'No' }}"
+        echo "Workflow status: ${{ job.status }}"
