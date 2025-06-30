@@ -1,0 +1,346 @@
+name: CloudKid Containers with GOST+ Tunnels
+
+on:
+  workflow_dispatch:
+    inputs:
+      container_count:
+        description: 'Number of containers to run (1-10)'
+        required: false
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '3'
+          - '5'
+          - '10'
+      tunnel_duration_minutes:
+        description: 'Keep tunnels running for (minutes)'
+        required: false
+        default: '30'
+        type: string
+
+jobs:
+  run-containers-with-tunnels:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Install GOST+
+      run: |
+        echo "📦 Installing GOST+ tunnel client..."
+        
+        # Download latest GOST+ release
+        GOST_VERSION=$(curl -s https://api.github.com/repos/go-gost/gost-plus/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        echo "Latest GOST+ version: $GOST_VERSION"
+        
+        # Download for Linux AMD64
+        wget -q "https://github.com/go-gost/gost-plus/releases/download/${GOST_VERSION}/gost-plus-linux-amd64-${GOST_VERSION}.tar.gz" -O gost-plus.tar.gz
+        
+        # Extract
+        tar -xzf gost-plus.tar.gz
+        
+        # Make executable and move to PATH
+        chmod +x gost-plus
+        sudo mv gost-plus /usr/local/bin/
+        
+        # Verify installation
+        gost-plus --version || echo "GOST+ installed"
+    
+    - name: Build CloudKid Docker image
+      run: |
+        if [ -f "Dockerfile" ]; then
+          echo "Building CloudKid image from Dockerfile..."
+          docker build -t cloudkid:latest .
+        else
+          echo "Creating basic SOCKS5 proxy Dockerfile..."
+          cat > Dockerfile << 'EOF'
+FROM ubuntu:latest
+
+RUN apt-get update && apt-get install -y \
+    dante-server \
+    net-tools \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure Dante SOCKS server
+RUN echo 'logoutput: stderr\n\
+internal: 0.0.0.0 port = 1080\n\
+external: eth0\n\
+method: none\n\
+user.privileged: root\n\
+user.unprivileged: nobody\n\
+client pass {\n\
+    from: 0.0.0.0/0 to: 0.0.0.0/0\n\
+    log: error\n\
+}\n\
+socks pass {\n\
+    from: 0.0.0.0/0 to: 0.0.0.0/0\n\
+    log: error\n\
+}' > /etc/danted.conf
+
+EXPOSE 1080
+
+CMD ["danted", "-f", "/etc/danted.conf"]
+EOF
+          docker build -t cloudkid:latest .
+        fi
+    
+    - name: Start CloudKid containers
+      id: start_containers
+      run: |
+        CONTAINER_COUNT=${{ github.event.inputs.container_count || '3' }}
+        echo "container_count=$CONTAINER_COUNT" >> $GITHUB_OUTPUT
+        
+        echo "🚀 Starting $CONTAINER_COUNT CloudKid containers..."
+        
+        # Create network
+        docker network create cloudkid-net 2>/dev/null || true
+        
+        # Start containers
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          NAME="wasque${i}"
+          
+          echo "[$i/$CONTAINER_COUNT] Starting container $NAME on port $PORT..."
+          
+          docker run -d \
+            --name $NAME \
+            --network cloudkid-net \
+            -p ${PORT}:1080 \
+            cloudkid:latest
+          
+          if docker ps | grep -q $NAME; then
+            echo "✓ Container $NAME started on port $PORT"
+          else
+            echo "✗ Failed to start container $NAME"
+            docker logs $NAME
+            exit 1
+          fi
+          
+          # Small delay
+          sleep 2
+        done
+        
+        echo "All containers started!"
+    
+    - name: Create GOST+ tunnel configuration
+      run: |
+        CONTAINER_COUNT=${{ steps.start_containers.outputs.container_count }}
+        
+        echo "🌐 Creating GOST+ tunnel configuration..."
+        
+        # Create config directory
+        mkdir -p gost-configs
+        
+        # Create a config file for each tunnel
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          CONFIG_FILE="gost-configs/tunnel-${i}.json"
+          
+          # Create GOST+ config for public tunnel
+          cat > $CONFIG_FILE << EOF
+{
+  "servers": [
+    {
+      "url": "tunnel://:0?net=ws&host=tunnel.gost.plus",
+      "handler": {
+        "type": "tunnel",
+        "metadata": {
+          "ingress": "socks5://localhost:${PORT}"
+        }
+      },
+      "listener": {
+        "type": "tunnel",
+        "metadata": {
+          "net": "ws"
+        }
+      }
+    }
+  ]
+}
+EOF
+          echo "Created config for port $PORT"
+        done
+    
+    - name: Start GOST+ tunnels
+      id: start_tunnels
+      run: |
+        CONTAINER_COUNT=${{ steps.start_containers.outputs.container_count }}
+        
+        echo "🚇 Starting GOST+ tunnels..."
+        echo "" > tunnel_addresses.txt
+        
+        # Start GOST+ tunnel for each container
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          CONFIG_FILE="gost-configs/tunnel-${i}.json"
+          LOG_FILE="gost-tunnel-${i}.log"
+          
+          echo "Starting tunnel for wasque${i} (port $PORT)..."
+          
+          # Start GOST+ in background and capture output
+          nohup gost-plus -C $CONFIG_FILE > $LOG_FILE 2>&1 &
+          GOST_PID=$!
+          echo $GOST_PID > "gost-pid-${i}.txt"
+          
+          # Wait for tunnel to establish and extract the public URL
+          echo "Waiting for tunnel to connect..."
+          ATTEMPTS=0
+          MAX_ATTEMPTS=30
+          
+          while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+            if grep -q "tunnel server ready" $LOG_FILE 2>/dev/null; then
+              # Extract the tunnel URL
+              TUNNEL_URL=$(grep -oP 'tunnel://[a-zA-Z0-9]+:[a-zA-Z0-9]+@[^/]+' $LOG_FILE | head -1)
+              
+              if [ ! -z "$TUNNEL_URL" ]; then
+                # Convert tunnel:// to socks5:// format
+                SOCKS_URL=$(echo $TUNNEL_URL | sed 's|tunnel://|socks5://|')
+                echo "✓ Tunnel established for wasque${i}: $SOCKS_URL" | tee -a tunnel_addresses.txt
+                break
+              fi
+            fi
+            sleep 2
+            ATTEMPTS=$((ATTEMPTS + 1))
+          done
+          
+          if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
+            echo "⚠️  Timeout waiting for tunnel ${i} to establish"
+            cat $LOG_FILE
+          fi
+          
+          # Add delay between tunnel starts
+          sleep 5
+        done
+        
+        # Save tunnel addresses as output
+        echo "tunnel_addresses<<EOF" >> $GITHUB_OUTPUT
+        cat tunnel_addresses.txt >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Display tunnel information
+      run: |
+        echo "🎯 SOCKS5 Proxy Tunnels Ready!"
+        echo "=============================="
+        echo ""
+        echo "Your SOCKS5 proxies are accessible at:"
+        echo ""
+        cat tunnel_addresses.txt
+        echo ""
+        echo "📌 How to use these proxies:"
+        echo ""
+        echo "1. With curl:"
+        echo "   curl -x socks5://username:password@tunnel.gost.plus:PORT https://api.ipify.org"
+        echo ""
+        echo "2. With Python requests:"
+        echo "   proxies = {"
+        echo "     'http': 'socks5://username:password@tunnel.gost.plus:PORT',"
+        echo "     'https': 'socks5://username:password@tunnel.gost.plus:PORT'"
+        echo "   }"
+        echo ""
+        echo "3. Configure your browser or application to use:"
+        echo "   Server: tunnel.gost.plus"
+        echo "   Port: [from the URLs above]"
+        echo "   Username: [from the URLs above]"
+        echo "   Password: [from the URLs above]"
+        echo ""
+        echo "These tunnels will remain active for ${{ github.event.inputs.tunnel_duration_minutes || '30' }} minutes."
+    
+    - name: Test tunnels
+      run: |
+        echo "🧪 Testing SOCKS5 tunnels..."
+        echo ""
+        
+        # Install required tools
+        sudo apt-get update -qq
+        sudo apt-get install -y netcat-openbsd curl
+        
+        # Test each tunnel
+        i=1
+        while IFS= read -r line; do
+          if [[ $line == *"socks5://"* ]]; then
+            # Extract connection details
+            TUNNEL_URL=$(echo $line | grep -oP 'socks5://[^ ]+')
+            
+            echo "Testing tunnel $i: $TUNNEL_URL"
+            
+            # Test with curl through SOCKS5
+            IP=$(curl -s -x $TUNNEL_URL https://api.ipify.org 2>/dev/null || echo "Failed")
+            
+            if [ "$IP" != "Failed" ]; then
+              echo "✅ Tunnel $i working! Public IP: $IP"
+            else
+              echo "❌ Tunnel $i test failed"
+            fi
+            
+            i=$((i + 1))
+          fi
+        done < tunnel_addresses.txt
+    
+    - name: Keep tunnels running
+      run: |
+        DURATION=${{ github.event.inputs.tunnel_duration_minutes || '30' }}
+        echo ""
+        echo "⏱️  Keeping tunnels active for $DURATION minutes..."
+        echo "You can use the SOCKS5 proxies during this time."
+        echo ""
+        
+        # Monitor tunnels every minute
+        for minute in $(seq 1 $DURATION); do
+          echo "[$minute/$DURATION minutes] Tunnels status:"
+          
+          # Check each GOST+ process
+          for pidfile in gost-pid-*.txt; do
+            if [ -f "$pidfile" ]; then
+              PID=$(cat $pidfile)
+              if ps -p $PID > /dev/null 2>&1; then
+                echo "  ✓ Tunnel $(basename $pidfile .txt) is running (PID: $PID)"
+              else
+                echo "  ✗ Tunnel $(basename $pidfile .txt) has stopped"
+              fi
+            fi
+          done
+          
+          # Check Docker containers
+          echo "  Active containers: $(docker ps --filter "name=wasque" -q | wc -l)"
+          
+          if [ $minute -lt $DURATION ]; then
+            sleep 60
+          fi
+        done
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "🧹 Cleaning up..."
+        
+        # Stop GOST+ processes
+        for pidfile in gost-pid-*.txt; do
+          if [ -f "$pidfile" ]; then
+            PID=$(cat $pidfile)
+            kill $PID 2>/dev/null || true
+          fi
+        done
+        
+        # Stop Docker containers
+        docker ps --filter "name=wasque" -q | xargs -r docker stop || true
+        
+        # Remove network
+        docker network rm cloudkid-net 2>/dev/null || true
+        
+        echo "Cleanup completed"
+    
+    - name: Upload tunnel logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: gost-tunnel-logs
+        path: |
+          gost-tunnel-*.log
+          tunnel_addresses.txt
+        retention-days: 1
