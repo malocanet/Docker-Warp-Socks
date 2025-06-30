@@ -1,0 +1,343 @@
+name: CloudKid with Public SOCKS5 Tunnels
+
+on:
+  workflow_dispatch:
+    inputs:
+      container_count:
+        description: 'Number of containers to run'
+        required: false
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+      tunnel_service:
+        description: 'Tunnel service to use'
+        required: false
+        default: 'ngrok'
+        type: choice
+        options:
+          - 'ngrok'
+          - 'cloudflared'
+          - 'gost'
+
+jobs:
+  deploy-proxies:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Install tunnel tools
+      run: |
+        echo "📦 Installing tunnel tools..."
+        
+        # Install ngrok
+        curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+        echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+        sudo apt-get update -qq
+        sudo apt-get install -y ngrok || echo "ngrok install failed, trying alternative"
+        
+        # Alternative ngrok install
+        if ! command -v ngrok &> /dev/null; then
+          wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          tar -xzf ngrok-v3-stable-linux-amd64.tgz
+          sudo mv ngrok /usr/local/bin/
+        fi
+        
+        # Install cloudflared
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x cloudflared-linux-amd64
+        sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+        
+        # Install GOST
+        wget -q https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz
+        gunzip gost-linux-amd64-2.11.5.gz
+        chmod +x gost-linux-amd64-2.11.5
+        sudo mv gost-linux-amd64-2.11.5 /usr/local/bin/gost
+        
+        echo "✓ Tunnel tools installed"
+    
+    - name: Build SOCKS5 proxy image
+      run: |
+        echo "🔨 Building SOCKS5 proxy Docker image..."
+        
+        cat > Dockerfile << 'EOF'
+FROM alpine:latest
+
+# Install Dante SOCKS server
+RUN apk add --no-cache dante-server
+
+# Create config
+RUN echo 'logoutput: stderr
+internal: 0.0.0.0 port = 1080
+external: eth0
+socksmethod: none
+clientmethod: none
+
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error
+}
+
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: bind connect udpassociate
+    log: error
+}' > /etc/sockd.conf
+
+EXPOSE 1080
+
+CMD ["sockd", "-f", "/etc/sockd.conf"]
+EOF
+        
+        docker build -t socks5-proxy:latest .
+    
+    - name: Start SOCKS5 containers
+      id: start_containers
+      run: |
+        CONTAINER_COUNT=${{ github.event.inputs.container_count || '3' }}
+        echo "container_count=$CONTAINER_COUNT" >> $GITHUB_OUTPUT
+        
+        echo "🚀 Starting $CONTAINER_COUNT SOCKS5 proxy containers..."
+        
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          NAME="socks-proxy-${i}"
+          
+          echo "Starting container $NAME on port $PORT..."
+          
+          docker run -d \
+            --name $NAME \
+            -p ${PORT}:1080 \
+            socks5-proxy:latest
+          
+          # Verify container is running
+          sleep 2
+          if docker ps | grep -q $NAME; then
+            echo "✓ Container $NAME running on localhost:$PORT"
+          else
+            echo "✗ Failed to start $NAME"
+            docker logs $NAME
+          fi
+        done
+    
+    - name: Create public tunnels
+      id: create_tunnels
+      run: |
+        CONTAINER_COUNT=${{ steps.start_containers.outputs.container_count }}
+        SERVICE=${{ github.event.inputs.tunnel_service || 'ngrok' }}
+        
+        echo "🌐 Creating public tunnels using $SERVICE..."
+        echo "" > tunnel_urls.txt
+        
+        # Create tunnels based on selected service
+        case $SERVICE in
+          "ngrok")
+            # Note: For production use, you should use NGROK_AUTH_TOKEN secret
+            echo "Using ngrok (limited without auth token)..."
+            
+            for i in $(seq 1 $CONTAINER_COUNT); do
+              PORT=$((54700 + i - 1))
+              
+              # Start ngrok tunnel
+              ngrok tcp $PORT --log=stdout > ngrok-${i}.log 2>&1 &
+              NGROK_PID=$!
+              echo $NGROK_PID > ngrok-pid-${i}.txt
+              
+              # Wait for tunnel
+              sleep 5
+              
+              # Get tunnel URL from ngrok API
+              TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | \
+                grep -o '"public_url":"[^"]*"' | \
+                grep -o 'tcp://[^"]*' | head -1 || echo "")
+              
+              if [ ! -z "$TUNNEL_URL" ]; then
+                echo "✓ Proxy $i: $TUNNEL_URL (SOCKS5)" | tee -a tunnel_urls.txt
+              else
+                echo "⚠️  Failed to get ngrok URL for proxy $i" | tee -a tunnel_urls.txt
+              fi
+            done
+            ;;
+            
+          "cloudflared")
+            echo "Using Cloudflare tunnels..."
+            
+            for i in $(seq 1 $CONTAINER_COUNT); do
+              PORT=$((54700 + i - 1))
+              
+              # Create cloudflared tunnel (requires more setup)
+              cloudflared tunnel --url tcp://localhost:$PORT > cloudflared-${i}.log 2>&1 &
+              CF_PID=$!
+              echo $CF_PID > cloudflared-pid-${i}.txt
+              
+              # Wait and extract URL
+              sleep 10
+              
+              TUNNEL_URL=$(grep -o 'https://[^[:space:]]*' cloudflared-${i}.log | head -1 || echo "")
+              
+              if [ ! -z "$TUNNEL_URL" ]; then
+                echo "✓ Proxy $i: $TUNNEL_URL (via Cloudflare)" | tee -a tunnel_urls.txt
+              else
+                echo "⚠️  Failed to create Cloudflare tunnel for proxy $i" | tee -a tunnel_urls.txt
+              fi
+            done
+            ;;
+            
+          "gost")
+            echo "Using GOST relay servers..."
+            
+            for i in $(seq 1 $CONTAINER_COUNT); do
+              PORT=$((54700 + i - 1))
+              
+              # Use public GOST relay
+              gost -L relay+ws://:0/:$PORT -F relay+wss://relay.gost.plus:443 > gost-${i}.log 2>&1 &
+              GOST_PID=$!
+              echo $GOST_PID > gost-pid-${i}.txt
+              
+              sleep 5
+              
+              # Extract relay info from log
+              RELAY_INFO=$(grep -o 'relay://[^[:space:]]*' gost-${i}.log | head -1 || echo "")
+              
+              if [ ! -z "$RELAY_INFO" ]; then
+                echo "✓ Proxy $i: Use GOST client with $RELAY_INFO" | tee -a tunnel_urls.txt
+              else
+                echo "✓ Proxy $i: SOCKS5 on localhost:$PORT (GOST relay active)" | tee -a tunnel_urls.txt
+              fi
+            done
+            ;;
+        esac
+        
+        echo "tunnel_urls<<EOF" >> $GITHUB_OUTPUT
+        cat tunnel_urls.txt >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Setup SSH tunnel (Alternative)
+      run: |
+        echo ""
+        echo "🔐 Alternative: SSH Tunnel Setup"
+        echo "================================"
+        echo ""
+        echo "You can also access these proxies via SSH tunnel:"
+        echo ""
+        echo "1. Add this to your ~/.ssh/config:"
+        echo ""
+        echo "Host github-socks"
+        echo "  HostName $(curl -s https://api.ipify.org)"
+        echo "  User runner"
+        echo "  Port 22"
+        echo "  DynamicForward 1080"
+        echo "  StrictHostKeyChecking no"
+        echo ""
+        echo "2. Then connect with: ssh -D 1080 github-socks"
+        echo ""
+    
+    - name: Display connection information
+      run: |
+        echo ""
+        echo "🎯 SOCKS5 Proxies Ready!"
+        echo "========================"
+        echo ""
+        echo "Active proxies:"
+        cat tunnel_urls.txt
+        echo ""
+        echo "📋 Usage Instructions:"
+        echo "---------------------"
+        echo ""
+        echo "1. Configure your application:"
+        echo "   - Proxy Type: SOCKS5"
+        echo "   - No authentication required"
+        echo ""
+        echo "2. Test with curl:"
+        echo '   curl -x socks5://proxy-address https://api.ipify.org'
+        echo ""
+        echo "3. Python example:"
+        echo "   import requests"
+        echo "   proxies = {"
+        echo "     'http': 'socks5://proxy-address',"
+        echo "     'https': 'socks5://proxy-address'"
+        echo "   }"
+        echo "   r = requests.get('https://api.ipify.org', proxies=proxies)"
+        echo ""
+        echo "The proxies will remain active for this workflow run."
+    
+    - name: Test proxies
+      run: |
+        echo ""
+        echo "🧪 Testing SOCKS5 proxies..."
+        
+        # Install test dependencies
+        pip install requests[socks] --quiet
+        
+        # Test each proxy
+        python3 << 'EOF'
+import requests
+import re
+
+with open('tunnel_urls.txt', 'r') as f:
+    lines = f.readlines()
+
+for line in lines:
+    if 'Proxy' in line:
+        # Extract proxy URL
+        match = re.search(r'(tcp://[^\s]+|socks5://[^\s]+)', line)
+        if match:
+            proxy_url = match.group(1)
+            # Convert tcp:// to socks5:// if needed
+            if proxy_url.startswith('tcp://'):
+                proxy_url = proxy_url.replace('tcp://', 'socks5://')
+            
+            try:
+                proxies = {
+                    'http': proxy_url,
+                    'https': proxy_url
+                }
+                # Test proxy
+                r = requests.get('https://api.ipify.org', proxies=proxies, timeout=10)
+                print(f"✅ {proxy_url} - Working! IP: {r.text}")
+            except Exception as e:
+                print(f"❌ {proxy_url} - Error: {str(e)}")
+EOF
+    
+    - name: Keep proxies running
+      run: |
+        echo ""
+        echo "⏱️  Keeping proxies active..."
+        echo "The proxies will remain available until this workflow completes."
+        echo ""
+        echo "To keep them running longer, you can:"
+        echo "1. Increase the workflow timeout"
+        echo "2. Use the 'workflow_dispatch' trigger with a sleep duration"
+        echo ""
+        
+        # Keep running for 30 minutes by default
+        DURATION_MINUTES=30
+        echo "Proxies will be available for $DURATION_MINUTES minutes..."
+        
+        for i in $(seq 1 $DURATION_MINUTES); do
+          echo "[$i/$DURATION_MINUTES] Proxies active. Containers running: $(docker ps -q | wc -l)"
+          sleep 60
+        done
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "🧹 Cleaning up..."
+        
+        # Stop all tunnel processes
+        for pidfile in *-pid-*.txt; do
+          if [ -f "$pidfile" ]; then
+            PID=$(cat $pidfile)
+            kill $PID 2>/dev/null || true
+          fi
+        done
+        
+        # Stop Docker containers
+        docker ps -q | xargs -r docker stop || true
+        
+        echo "Cleanup completed"
