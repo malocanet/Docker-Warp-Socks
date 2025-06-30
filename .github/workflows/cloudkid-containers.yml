@@ -1,0 +1,120 @@
+name: Run CloudKid Containers
+
+on:
+  workflow_dispatch:
+    inputs:
+      container_count:
+        description: 'Number of containers to run'
+        required: false
+        default: '10'
+        type: string
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  run-containers:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Check if Dockerfile exists
+      id: check_dockerfile
+      run: |
+        if [ -f "Dockerfile" ]; then
+          echo "dockerfile_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "dockerfile_exists=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Build CloudKid Docker image
+      if: steps.check_dockerfile.outputs.dockerfile_exists == 'true'
+      run: |
+        docker build -t cloudkid:latest .
+    
+    - name: Pull CloudKid image (if no Dockerfile)
+      if: steps.check_dockerfile.outputs.dockerfile_exists == 'false'
+      run: |
+        # Replace with actual image name if it's published to a registry
+        echo "No Dockerfile found. Please ensure cloudkid:latest image is available."
+        # docker pull your-registry/cloudkid:latest
+        # docker tag your-registry/cloudkid:latest cloudkid:latest
+    
+    - name: Start CloudKid containers
+      run: |
+        CONTAINER_COUNT=${{ github.event.inputs.container_count || '10' }}
+        echo "Starting $CONTAINER_COUNT CloudKid containers..."
+        
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          NAME="wasque${i}"
+          
+          echo "Starting container $NAME on port $PORT..."
+          
+          docker run -d \
+            --name $NAME \
+            --rm \
+            --privileged \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -p ${PORT}:1080 \
+            cloudkid:latest
+          
+          # Check if container started successfully
+          if docker ps | grep -q $NAME; then
+            echo "✓ Container $NAME started successfully on port $PORT"
+          else
+            echo "✗ Failed to start container $NAME"
+            exit 1
+          fi
+          
+          # Wait 30 seconds before starting next container (except for the last one)
+          if [ $i -lt $CONTAINER_COUNT ]; then
+            echo "Waiting 30 seconds before starting next container..."
+            sleep 30
+          fi
+        done
+        
+        echo "All containers started successfully!"
+    
+    - name: Display running containers
+      run: |
+        echo "Running CloudKid containers:"
+        docker ps --filter "name=wasque" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    
+    - name: Container health check
+      run: |
+        echo "Checking container health..."
+        for i in $(seq 1 ${{ github.event.inputs.container_count || '10' }}); do
+          NAME="wasque${i}"
+          if docker ps | grep -q $NAME; then
+            echo "✓ $NAME is running"
+          else
+            echo "✗ $NAME is not running"
+          fi
+        done
+    
+    - name: Keep containers running (optional)
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        # This step keeps the workflow running for monitoring
+        # Adjust the duration as needed
+        echo "Containers are running. Workflow will continue for 5 minutes for monitoring..."
+        sleep 300
+    
+    - name: Cleanup containers (optional)
+      if: always()
+      run: |
+        echo "Cleaning up containers..."
+        docker ps --filter "name=wasque" -q | xargs -r docker stop || true
+        echo "Cleanup completed"
