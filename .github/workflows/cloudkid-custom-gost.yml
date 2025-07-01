@@ -1,0 +1,392 @@
+name: CloudKid with Custom GOST Endpoint
+
+on:
+  workflow_dispatch:
+    inputs:
+      container_count:
+        description: 'Number of containers to run'
+        required: false
+        default: '5'
+        type: choice
+        options:
+          - '1'
+          - '3'
+          - '5'
+          - '10'
+      tunnel_duration_minutes:
+        description: 'Keep tunnels active for (minutes)'
+        required: false
+        default: '30'
+        type: string
+      gost_server:
+        description: 'Custom GOST server endpoint'
+        required: false
+        default: 'server2.k2025.bond'
+        type: string
+
+jobs:
+  deploy-with-custom-gost:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Install GOST client
+      run: |
+        echo "📦 Installing GOST v3 client..."
+        
+        # Download GOST v3
+        GOST_VERSION="3.0.0-rc10"
+        wget -q "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz" -O gost.tar.gz
+        
+        # Extract
+        tar -xzf gost.tar.gz
+        
+        # Make executable and move to PATH
+        chmod +x gost
+        sudo mv gost /usr/local/bin/
+        
+        # Verify installation
+        gost --version || echo "GOST v3 installed"
+    
+    - name: Build CloudKid Docker image
+      run: |
+        if [ -f "Dockerfile" ]; then
+          echo "Building CloudKid image from existing Dockerfile..."
+          docker build -t cloudkid:latest .
+        else
+          echo "Creating SOCKS5 proxy Dockerfile..."
+          cat > Dockerfile << 'EOF'
+FROM alpine:latest
+
+# Install 3proxy for SOCKS5
+RUN apk add --no-cache wget build-base
+
+# Download and compile 3proxy
+RUN wget -q https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz && \
+    tar -xzf 0.9.4.tar.gz && \
+    cd 3proxy-0.9.4 && \
+    make -f Makefile.Linux && \
+    cp bin/3proxy /usr/local/bin/ && \
+    cd .. && rm -rf 3proxy-0.9.4 0.9.4.tar.gz
+
+# Create config
+RUN echo 'daemon\n\
+nserver 8.8.8.8\n\
+nserver 8.8.4.4\n\
+nscache 65536\n\
+timeouts 1 5 30 60 180 1800 15 60\n\
+auth none\n\
+allow *\n\
+socks -p1080' > /etc/3proxy.cfg
+
+EXPOSE 1080
+
+CMD ["3proxy", "/etc/3proxy.cfg"]
+EOF
+          docker build -t cloudkid:latest .
+        fi
+    
+    - name: Start CloudKid containers
+      id: start_containers
+      run: |
+        CONTAINER_COUNT=${{ github.event.inputs.container_count || '5' }}
+        echo "container_count=$CONTAINER_COUNT" >> $GITHUB_OUTPUT
+        
+        echo "🚀 Starting $CONTAINER_COUNT CloudKid containers..."
+        
+        # Create network
+        docker network create cloudkid-net 2>/dev/null || true
+        
+        # Start containers
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          NAME="wasque${i}"
+          
+          echo "[$i/$CONTAINER_COUNT] Starting container $NAME on port $PORT..."
+          
+          docker run -d \
+            --name $NAME \
+            --network cloudkid-net \
+            -p ${PORT}:1080 \
+            cloudkid:latest
+          
+          if docker ps | grep -q $NAME; then
+            echo "✓ Container $NAME started on port $PORT"
+          else
+            echo "✗ Failed to start container $NAME"
+            docker logs $NAME
+            exit 1
+          fi
+          
+          # Small delay between starts
+          sleep 2
+        done
+        
+        echo "All containers started!"
+        
+        # Test local connectivity
+        echo ""
+        echo "Testing local SOCKS5 proxies..."
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          if timeout 5 bash -c "echo > /dev/tcp/localhost/$PORT" 2>/dev/null; then
+            echo "✓ Port $PORT is responding"
+          else
+            echo "✗ Port $PORT is not responding"
+          fi
+        done
+    
+    - name: Create GOST tunnel configurations
+      run: |
+        CONTAINER_COUNT=${{ steps.start_containers.outputs.container_count }}
+        GOST_SERVER=${{ github.event.inputs.gost_server || 'server2.k2025.bond' }}
+        
+        echo "🔧 Creating GOST tunnel configurations for $GOST_SERVER..."
+        
+        # Create config directory
+        mkdir -p gost-configs
+        
+        # Generate UUIDs for tunnel IDs
+        sudo apt-get install -y uuid-runtime
+        
+        # Create tunnel info file
+        echo "# GOST Tunnel Information" > tunnel_info.txt
+        echo "Server: $GOST_SERVER" >> tunnel_info.txt
+        echo "Generated: $(date)" >> tunnel_info.txt
+        echo "" >> tunnel_info.txt
+        
+        # Store tunnel IDs
+        > tunnel_ids.txt
+        
+        for i in $(seq 1 $CONTAINER_COUNT); do
+          PORT=$((54700 + i - 1))
+          TUNNEL_ID=$(uuidgen)
+          
+          echo "${i}:${TUNNEL_ID}:${PORT}" >> tunnel_ids.txt
+          
+          echo "Container wasque${i} (port $PORT):" >> tunnel_info.txt
+          echo "  Tunnel ID: $TUNNEL_ID" >> tunnel_info.txt
+          echo "" >> tunnel_info.txt
+        done
+    
+    - name: Start GOST tunnels
+      id: create_tunnels
+      run: |
+        CONTAINER_COUNT=${{ steps.start_containers.outputs.container_count }}
+        GOST_SERVER=${{ github.event.inputs.gost_server || 'server2.k2025.bond' }}
+        
+        echo "🚇 Starting GOST reverse proxy tunnels to $GOST_SERVER..."
+        echo "" > tunnel_endpoints.txt
+        
+        # Start tunnel for each container
+        while IFS=':' read -r idx tunnel_id port; do
+          echo ""
+          echo "Starting tunnel for wasque${idx} (port $port)..."
+          
+          # Generate a custom endpoint name (first 8 chars of tunnel ID)
+          ENDPOINT_NAME="socks${idx}-${tunnel_id:0:8}"
+          
+          # Start GOST tunnel
+          LOG_FILE="gost-tunnel-${idx}.log"
+          
+          # Using GOST v3 syntax for reverse proxy
+          nohup gost -L "rtcp://${ENDPOINT_NAME}/localhost:${port}" \
+                     -F "tunnel+wss://${GOST_SERVER}:443?tunnel.id=${tunnel_id}" \
+                     > $LOG_FILE 2>&1 &
+          
+          GOST_PID=$!
+          echo $GOST_PID > "gost-pid-${idx}.txt"
+          
+          # Wait for tunnel to establish
+          echo "Waiting for tunnel to establish..."
+          sleep 5
+          
+          # Check if tunnel is established
+          if grep -q "create tunnel on" $LOG_FILE 2>/dev/null; then
+            # Extract endpoint from log
+            ENDPOINT=$(grep -oP 'endpoint":"[^"]+' $LOG_FILE | cut -d'"' -f3 | head -1)
+            
+            if [ -z "$ENDPOINT" ]; then
+              ENDPOINT=$ENDPOINT_NAME
+            fi
+            
+            echo "✓ Tunnel established for wasque${idx}" | tee -a tunnel_endpoints.txt
+            echo "  Endpoint: https://${ENDPOINT}.${GOST_SERVER}" | tee -a tunnel_endpoints.txt
+            echo "  Tunnel ID: ${tunnel_id}" | tee -a tunnel_endpoints.txt
+            echo "  Local port: ${port}" | tee -a tunnel_endpoints.txt
+            echo "" | tee -a tunnel_endpoints.txt
+          else
+            echo "⚠️  Failed to establish tunnel for wasque${idx}"
+            cat $LOG_FILE
+          fi
+          
+        done < tunnel_ids.txt
+        
+        # Save endpoints as output
+        echo "endpoints<<EOF" >> $GITHUB_OUTPUT
+        cat tunnel_endpoints.txt >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create TCP access points
+      run: |
+        CONTAINER_COUNT=${{ steps.start_containers.outputs.container_count }}
+        GOST_SERVER=${{ github.event.inputs.gost_server || 'server2.k2025.bond' }}
+        
+        echo "🔌 Creating TCP access points for SOCKS5 proxies..."
+        echo "" > access_info.txt
+        
+        echo "=== SOCKS5 Proxy Access Information ===" | tee -a access_info.txt
+        echo "Server: $GOST_SERVER" | tee -a access_info.txt
+        echo "" | tee -a access_info.txt
+        
+        # For each tunnel, provide access instructions
+        while IFS=':' read -r idx tunnel_id port; do
+          ENDPOINT_NAME="socks${idx}-${tunnel_id:0:8}"
+          
+          echo "Proxy $idx (wasque${idx}):" | tee -a access_info.txt
+          echo "  Method 1 - Direct TCP tunnel:" | tee -a access_info.txt
+          echo "    1. Run locally: gost -L tcp://:${port}/${ENDPOINT_NAME}.${GOST_SERVER} -F tunnel+wss://${GOST_SERVER}:443?tunnel.id=${tunnel_id}" | tee -a access_info.txt
+          echo "    2. Use SOCKS5 proxy at: localhost:${port}" | tee -a access_info.txt
+          echo "" | tee -a access_info.txt
+          echo "  Method 2 - Via HTTPS endpoint:" | tee -a access_info.txt
+          echo "    URL: https://${ENDPOINT_NAME}.${GOST_SERVER}" | tee -a access_info.txt
+          echo "    (Requires HTTP-to-SOCKS5 adapter)" | tee -a access_info.txt
+          echo "" | tee -a access_info.txt
+          
+        done < tunnel_ids.txt
+    
+    - name: Display usage instructions
+      run: |
+        GOST_SERVER=${{ github.event.inputs.gost_server || 'server2.k2025.bond' }}
+        
+        echo ""
+        echo "📋 How to Connect to Your SOCKS5 Proxies"
+        echo "========================================"
+        echo ""
+        echo "Option 1: Local GOST Client (Recommended)"
+        echo "-----------------------------------------"
+        echo "1. Install GOST v3 on your local machine:"
+        echo "   wget https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_amd64.tar.gz"
+        echo "   tar -xzf gost_3.0.0-rc10_linux_amd64.tar.gz"
+        echo "   sudo mv gost /usr/local/bin/"
+        echo ""
+        echo "2. Copy the tunnel commands from above and run locally"
+        echo ""
+        echo "3. Configure your application to use SOCKS5 proxy at localhost:PORT"
+        echo ""
+        echo "Option 2: Direct Connection (if supported)"
+        echo "------------------------------------------"
+        echo "Some GOST servers support direct SOCKS5 connections:"
+        echo "  Server: ${GOST_SERVER}"
+        echo "  Port: Check server documentation"
+        echo "  Auth: Use tunnel ID as credentials"
+        echo ""
+        echo "Testing Your Proxy:"
+        echo "-------------------"
+        echo "curl -x socks5://localhost:PORT https://api.ipify.org"
+        echo ""
+        cat access_info.txt
+    
+    - name: Test tunnels via local client
+      run: |
+        echo ""
+        echo "🧪 Testing tunnel connectivity..."
+        
+        # Test one tunnel as example
+        if [ -f "tunnel_ids.txt" ]; then
+          # Get first tunnel info
+          FIRST_LINE=$(head -1 tunnel_ids.txt)
+          IFS=':' read -r idx tunnel_id port <<< "$FIRST_LINE"
+          
+          GOST_SERVER=${{ github.event.inputs.gost_server || 'server2.k2025.bond' }}
+          ENDPOINT_NAME="socks${idx}-${tunnel_id:0:8}"
+          
+          echo "Testing tunnel 1 connectivity..."
+          
+          # Start local GOST client
+          gost -L tcp://:55000/${ENDPOINT_NAME}.${GOST_SERVER} \
+               -F tunnel+wss://${GOST_SERVER}:443?tunnel.id=${tunnel_id} \
+               > test-client.log 2>&1 &
+          
+          TEST_PID=$!
+          sleep 5
+          
+          # Test through the tunnel
+          if timeout 10 curl -s -x socks5://localhost:55000 https://api.ipify.org > /dev/null 2>&1; then
+            IP=$(curl -s -x socks5://localhost:55000 https://api.ipify.org)
+            echo "✅ Tunnel test successful! Public IP: $IP"
+          else
+            echo "❌ Tunnel test failed"
+            cat test-client.log
+          fi
+          
+          kill $TEST_PID 2>/dev/null || true
+        fi
+    
+    - name: Keep tunnels active
+      run: |
+        DURATION=${{ github.event.inputs.tunnel_duration_minutes || '30' }}
+        
+        echo ""
+        echo "⏱️  Keeping tunnels active for $DURATION minutes..."
+        echo "The SOCKS5 proxies are now accessible via your GOST server."
+        echo ""
+        
+        # Monitor status
+        for minute in $(seq 1 $DURATION); do
+          echo "[$minute/$DURATION] Status check:"
+          
+          # Check GOST processes
+          active_tunnels=0
+          for pidfile in gost-pid-*.txt; do
+            if [ -f "$pidfile" ]; then
+              PID=$(cat $pidfile)
+              if ps -p $PID > /dev/null 2>&1; then
+                active_tunnels=$((active_tunnels + 1))
+              fi
+            fi
+          done
+          
+          echo "  Active GOST tunnels: $active_tunnels"
+          echo "  Active Docker containers: $(docker ps --filter "name=wasque" -q | wc -l)"
+          
+          if [ $minute -lt $DURATION ]; then
+            sleep 60
+          fi
+        done
+    
+    - name: Upload tunnel information
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: gost-tunnel-info
+        path: |
+          tunnel_info.txt
+          tunnel_ids.txt
+          tunnel_endpoints.txt
+          access_info.txt
+          gost-tunnel-*.log
+        retention-days: 1
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "🧹 Cleaning up..."
+        
+        # Stop GOST processes
+        for pidfile in gost-pid-*.txt; do
+          if [ -f "$pidfile" ]; then
+            PID=$(cat $pidfile)
+            kill $PID 2>/dev/null || true
+          fi
+        done
+        
+        # Stop Docker containers
+        docker ps --filter "name=wasque" -q | xargs -r docker stop || true
+        
+        # Remove network
+        docker network rm cloudkid-net 2>/dev/null || true
+        
+        echo "Cleanup completed"
